@@ -109,6 +109,42 @@ class ExllamaHF(PreTrainedModel):
 
         return CausalLMOutputWithPast(logits=logits, past_key_values=seq if use_cache else None, loss=loss)
 
+    def call_perplexity(self, encs, pre_idx):
+        orig_len = encs[0].shape[1]
+        var_idx = orig_len - pre_idx - 1
+        var_idx = max(0, var_idx)
+        
+        ex_cache = self.ex_cache
+        ex_cache.current_seq_len = 0
+        
+        # orig
+        seq = encs[0][0].tolist()
+        self.ex_model.forward(torch.tensor([seq[:var_idx]], dtype=torch.long), ex_cache, preprocess_only=True, lora=self.lora)
+        temp_cache = ex_cache.clone()
+        temp_current_seq_len  = ex_cache.current_seq_len
+        
+        result = []
+        
+        for enc in encs:
+            ex_cache = temp_cache.clone()
+            ex_cache.current_seq_len = temp_current_seq_len
+            seq = enc[0].tolist()
+            logits = self.ex_model.forward(torch.tensor([seq[var_idx:-1]], dtype=torch.long), ex_cache, last_id_only=False, lora=self.lora)
+            
+            assert len(logits.shape) == 3
+            assert logits.shape[0] == 1
+            assert len(enc.shape) == 2
+            assert enc.shape[0] == 1
+            logs = logits[0].to(device=enc.device)
+            logs -= torch.logsumexp(logs, dim=1, keepdim=True)
+            index = enc[0, var_idx + 1:].reshape(-1, 1)
+            logprob = torch.gather(logs, dim=1, index=index)
+            
+            result.append(dict(len=enc.shape[1] - var_idx - 1, logit=float(logprob.sum())))
+            # result.append(dict(len=enc.shape[1] - var_idx - 1, logit=logprob.flatten().tolist()))
+
+        return result
+    
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
         assert len(model_args) == 0 and len(kwargs) == 0, "extra args is currently not supported"

@@ -1,10 +1,12 @@
 import json
+import torch
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
 from extensions.api.util import build_parameters, try_start_cloudflared
 from modules import shared
-from modules.chat import generate_chat_reply
+from modules.chat import generate_chat_reply, generate_chat_prompt
 from modules.LoRA import add_lora_to_model
 from modules.models import load_model, unload_model
 from modules.models_settings import (
@@ -17,6 +19,43 @@ from modules.text_generation import (
     stop_everything_event
 )
 from modules.utils import get_available_models
+
+def calc_perplexity_v1(text):
+    encodings = encode(text, add_special_tokens=False)
+    seq_len = encodings.shape[1]
+    if hasattr(shared.model.config, 'max_position_embeddings'):
+        max_length = shared.model.config.max_position_embeddings
+    else:
+        max_length = 4096
+
+    input_ids = encodings[:, :]
+    target_ids = input_ids.clone()
+    # target_ids[:, :-target_len] = -100
+
+    with torch.no_grad():
+        outputs = shared.model(input_ids=input_ids, labels=target_ids)
+        logits = outputs.logits
+    
+    assert len(logits.shape) == 3   # 1, seq_len, tokens
+    assert logits.shape[0] == 1
+    assert len(encodings.shape) == 2
+    assert encodings.shape[0] == 1
+    logs = logits[0, :-1].to(device=encodings.device)
+    logs -= torch.logsumexp(logs, dim=1, keepdim=True)
+    index = encodings[0, 1:].reshape(-1, 1)
+    l = torch.gather(logs, dim=1, index=index)
+
+    return float(l.sum()), seq_len
+    # return l.flatten().tolist(), seq_len
+
+
+
+def calc_perplexity_v2(prompts, pre_idx=1):
+    encs = [encode(p, add_special_tokens=False) for p in prompts]
+    
+    result = shared.model.call_perplexity(encs, pre_idx)
+    
+    return result
 
 
 def get_model_info():
@@ -97,6 +136,66 @@ class Handler(BaseHTTPRequestHandler):
             })
 
             self.wfile.write(response.encode('utf-8'))
+
+        elif self.path == '/api/v1/chateval_o':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            generate_params = build_parameters(body, chat=True)
+            generate_params['stream'] = False
+
+            prompt = generate_chat_prompt("", generate_params, regenerate=False, _continue=True, history=generate_params['history'])
+            p, l = calc_perplexity_v1(prompt)
+
+            ret = [dict(logit=p, len=l)]
+            for choice in body.get('choices', []):
+                history = deepcopy(generate_params['history'])
+                history['internal'][-1][-1] += choice
+                history['visible'][-1][-1] += choice
+
+                p_new = generate_chat_prompt("", generate_params, regenerate=False, _continue=True, history=history)
+
+                p, l = calc_perplexity_v1(p_new)
+                ret.append(dict(logit=p, len=l))
+
+
+            response = json.dumps({
+                'ret': ret
+            })
+
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif self.path == '/api/v1/chateval':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
+            generate_params = build_parameters(body, chat=True)
+            generate_params['stream'] = False
+            
+            prompts = []
+
+            p = generate_chat_prompt("", generate_params, regenerate=False, _continue=True, history=generate_params['history'])
+            prompts.append(p)
+
+            for choice in body.get('choices', []):
+                history = deepcopy(generate_params['history'])
+                history['internal'][-1][-1] += choice
+                history['visible'][-1][-1] += choice
+
+                p = generate_chat_prompt("", generate_params, regenerate=False, _continue=True, history=history)
+                prompts.append(p)
+            
+            ret = calc_perplexity_v2(prompts)
+
+
+            response = json.dumps({
+                'ret': ret
+            })
+
+            self.wfile.write(response.encode('utf-8'))
+
 
         elif self.path == '/api/v1/stop-stream':
             self.send_response(200)
